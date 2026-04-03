@@ -9,11 +9,7 @@
 #![allow(clippy::manual_is_multiple_of)]
 
 use core::cmp::Ordering;
-use core::error::Error;
-use core::fmt;
 use core::fmt::Debug;
-use core::fmt::Display;
-use core::fmt::Formatter;
 
 use bitcoin::hashes::sha256;
 use bitcoin::ScriptBuf;
@@ -44,27 +40,21 @@ use serde::Serialize;
 use sync::RwLock;
 use tracing::error;
 
-#[derive(Debug)]
+/// Errors produced by the watch-only address cache and related wallet logic.
+#[derive(Debug, thiserror::Error)]
 pub enum WatchOnlyError<DatabaseError: Debug> {
+    /// The wallet has not been initialized yet.
+    #[error("Wallet isn't initialized")]
     WalletNotInitialized,
+    /// A requested transaction is not present in the cache.
+    #[error("Transaction not found")]
     TransactionNotFound,
+    /// Descriptor parsing or derivation failed.
+    #[error("Descriptor error: {0}")]
+    Descriptor(String),
+    /// An error from the backing address database implementation.
+    #[error("Database error: {0:?}")]
     DatabaseError(DatabaseError),
-}
-
-impl<DatabaseError: Debug> Display for WatchOnlyError<DatabaseError> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            WatchOnlyError::WalletNotInitialized => {
-                write!(f, "Wallet isn't initialized")
-            }
-            WatchOnlyError::TransactionNotFound => {
-                write!(f, "Transaction not found")
-            }
-            WatchOnlyError::DatabaseError(e) => {
-                write!(f, "Database error: {e:?}")
-            }
-        }
-    }
 }
 
 impl<DatabaseError: Debug> From<DatabaseError> for WatchOnlyError<DatabaseError> {
@@ -72,8 +62,6 @@ impl<DatabaseError: Debug> From<DatabaseError> for WatchOnlyError<DatabaseError>
         WatchOnlyError::DatabaseError(e)
     }
 }
-
-impl<T: Debug> Error for WatchOnlyError<T> {}
 
 /// Every address contains zero or more associated transactions, this struct defines what
 /// data we store for those.
@@ -194,20 +182,30 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         for (position, transaction) in block.txdata.iter().enumerate() {
             for (vin, txin) in transaction.input.iter().enumerate() {
                 if let Some(script) = self.utxo_index.get(&txin.previous_output) {
-                    let script = self
-                        .address_map
-                        .get(script)
-                        .expect("Can't cache a utxo for a address we don't have")
-                        .to_owned();
-                    let tx = self
-                        .get_transaction(&txin.previous_output.txid)
-                        .expect("We cached a utxo for a transaction we don't have");
+                    let Some(script) = self.address_map.get(script).cloned() else {
+                        error!(
+                            "Skipping inconsistent wallet state: missing address entry for outpoint {}:{}",
+                            txin.previous_output.txid,
+                            txin.previous_output.vout
+                        );
+                        continue;
+                    };
+                    let Some(tx) = self.get_transaction(&txin.previous_output.txid) else {
+                        error!(
+                            "Skipping inconsistent wallet state: missing cached transaction {}",
+                            txin.previous_output.txid
+                        );
+                        continue;
+                    };
 
-                    let utxo = tx
-                        .tx
-                        .output
-                        .get(txin.previous_output.vout as usize)
-                        .expect("Did we cache an invalid utxo?");
+                    let Some(utxo) = tx.tx.output.get(txin.previous_output.vout as usize) else {
+                        error!(
+                            "Skipping inconsistent wallet state: invalid previous output index {} for tx {}",
+                            txin.previous_output.vout,
+                            txin.previous_output.txid
+                        );
+                        continue;
+                    };
 
                     let merkle_block = MerkleProof::from_block(block, position as u64);
 
@@ -350,13 +348,14 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
     fn derive_addresses(&mut self) -> Result<(), WatchOnlyError<D::Error>> {
         let mut stats = self.database.get_stats()?;
         let descriptors = self.database.descs_get()?;
-        let descriptors = parse_descriptors(&descriptors).expect("We validate those descriptors");
+        let descriptors = parse_descriptors(&descriptors)
+            .map_err(|e| WatchOnlyError::Descriptor(e.to_string()))?;
         for desc in descriptors {
             let index = stats.derivation_index;
             for idx in index..(index + 100) {
                 let script = desc
                     .at_derivation_index(idx)
-                    .expect("We validate those descriptors before saving")
+                    .map_err(|e| WatchOnlyError::Descriptor(e.to_string()))?
                     .script_pubkey();
                 self.cache_address(script);
             }
@@ -366,7 +365,10 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
     }
 
     fn maybe_derive_addresses(&mut self) {
-        let stats = self.database.get_stats().unwrap();
+        let Ok(stats) = self.database.get_stats() else {
+            error!("Skipping address derivation: could not load wallet stats");
+            return;
+        };
         if stats.transaction_count > (stats.derivation_index as usize * 100) {
             let res = self.derive_addresses();
             if res.is_err() {
@@ -392,11 +394,16 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         let mut spends = Vec::new();
         for (idx, input) in transaction.input.iter().enumerate() {
             if self.utxo_index.contains_key(&input.previous_output) {
-                let prev_tx = self.get_transaction(&input.previous_output.txid).unwrap();
-                spends.push((
-                    idx,
-                    prev_tx.tx.output[input.previous_output.vout as usize].clone(),
-                ));
+                let Some(prev_tx) = self.get_transaction(&input.previous_output.txid) else {
+                    error!("Skipping spend tracking: previous tx missing from cache");
+                    continue;
+                };
+                let Some(prev_out) = prev_tx.tx.output.get(input.previous_output.vout as usize)
+                else {
+                    error!("Skipping spend tracking: previous output index out of bounds");
+                    continue;
+                };
+                spends.push((idx, prev_out.clone()));
             }
         }
         spends
@@ -405,11 +412,14 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
     fn cache_mempool_transaction(&mut self, transaction: &Transaction) -> Vec<TxOut> {
         let mut coins = self.find_spend(transaction);
         for (idx, spend) in coins.iter() {
-            let script = self
+            let Some(script) = self
                 .address_map
                 .get(&get_spk_hash(&spend.script_pubkey))
-                .unwrap()
-                .to_owned();
+                .cloned()
+            else {
+                error!("Skipping mempool spend cache: missing address mapping");
+                continue;
+            };
             self.cache_transaction(
                 transaction,
                 0,
@@ -424,7 +434,10 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         for (idx, out) in transaction.output.iter().enumerate() {
             let spk_hash = get_spk_hash(&out.script_pubkey);
             if self.script_set.contains(&spk_hash) {
-                let script = self.address_map.get(&spk_hash).unwrap().to_owned();
+                let Some(script) = self.address_map.get(&spk_hash).cloned() else {
+                    error!("Skipping mempool receive cache: missing address mapping");
+                    continue;
+                };
                 coins.push((idx, out.clone()));
                 self.cache_transaction(
                     transaction,
@@ -466,12 +479,25 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
         if let Some(address) = self.address_map.get_mut(&hash) {
             // This transaction is spending from this address, so we should remove the UTXO
             if is_spend {
-                assert!(value <= address.balance);
+                if value > address.balance {
+                    error!(
+                        "Skipping spend update due to inconsistent balance: txid={} index={} value={} balance={}",
+                        transaction.compute_txid(),
+                        index,
+                        value,
+                        address.balance
+                    );
+                    return;
+                }
                 address.balance -= value;
-                let input = transaction
-                    .input
-                    .get(index)
-                    .expect("Malformed call, index is bigger than the output vector");
+                let Some(input) = transaction.input.get(index) else {
+                    error!(
+                        "Skipping malformed spend update: input index {} out of bounds for tx {}",
+                        index,
+                        transaction.compute_txid()
+                    );
+                    return;
+                };
                 let idx = address
                     .utxos
                     .iter()
@@ -519,12 +545,24 @@ impl<D: AddressCacheDatabase> AddressCacheInner<D> {
             hash: transaction.compute_txid(),
             position,
         };
-        self.database
-            .save_transaction(&transaction_to_cache)
-            .expect("Database not working");
+        if let Err(e) = self.database.save_transaction(&transaction_to_cache) {
+            error!(
+                "Failed to persist cached transaction {} at height {}: {e:?}",
+                transaction_to_cache.hash, transaction_to_cache.height
+            );
+            return;
+        }
 
         if let Entry::Vacant(e) = self.address_map.entry(hash) {
-            let script = transaction.output[index].script_pubkey.clone();
+            let Some(output) = transaction.output.get(index) else {
+                error!(
+                    "Skipping cache insert: output index {} out of bounds for tx {}",
+                    index,
+                    transaction.compute_txid()
+                );
+                return;
+            };
+            let script = output.script_pubkey.clone();
             // This means `cache_transaction` have been called with an address we don't
             // follow. This may be useful for caching new addresses without re-scanning.
             // We can track this address from now onwards, but the past history is only
@@ -1008,5 +1046,14 @@ mod test {
 
         assert_eq!(address.transactions.len(), 2);
         assert_eq!(address.utxos.len(), 1);
+    }
+
+    #[test]
+    fn test_derive_addresses_invalid_descriptor_returns_error() {
+        let cache = get_test_cache();
+        cache.push_descriptor("invalid-descriptor").unwrap();
+
+        let err = cache.derive_addresses().unwrap_err();
+        assert!(matches!(err, crate::WatchOnlyError::Descriptor(_)));
     }
 }

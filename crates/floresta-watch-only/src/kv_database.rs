@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use core::error::Error;
-use core::fmt;
-use core::fmt::Display;
-use core::fmt::Formatter;
-
 use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::Error as EncodingError;
 use bitcoin::consensus::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
-use floresta_common::impl_error_from;
 use floresta_common::prelude::*;
 use kv::Bucket;
 use kv::Config;
 use kv::Store;
+use tracing::error;
 
 use super::AddressCacheDatabase;
 use super::Stats;
@@ -31,31 +26,29 @@ impl KvDatabase {
         Ok(KvDatabase(store, bucket))
     }
 }
-#[derive(Debug)]
+
+/// Errors returned when reading or writing the on-disk watch-only address database.
+#[derive(Debug, thiserror::Error)]
 pub enum KvDatabaseError {
-    KvError(kv::Error),
-    SerdeJsonError(serde_json::Error),
+    /// Underlying key-value store error.
+    #[error("KvError: {0}")]
+    KvError(#[from] kv::Error),
+    /// JSON serialization or deserialization failed.
+    #[error(transparent)]
+    SerdeJsonError(#[from] serde_json::Error),
+    /// Required wallet metadata has not been written yet.
+    #[error("Wallet not initialized")]
     WalletNotInitialized,
-    DeserializeError(EncodingError),
+    /// Bitcoin consensus encoding error while reading stored data.
+    #[error(transparent)]
+    DeserializeError(#[from] EncodingError),
+    /// A requested transaction is not stored in the database.
+    #[error("Transaction not found")]
     TransactionNotFound,
+    /// A stored transaction id key had an unexpected byte length.
+    #[error("Stored transaction id key has invalid length")]
+    InvalidTxidKey,
 }
-impl_error_from!(KvDatabaseError, serde_json::Error, SerdeJsonError);
-impl_error_from!(KvDatabaseError, kv::Error, KvError);
-impl_error_from!(KvDatabaseError, EncodingError, DeserializeError);
-
-impl Display for KvDatabaseError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            KvDatabaseError::KvError(e) => write!(f, "KvError: {e}"),
-            KvDatabaseError::SerdeJsonError(e) => write!(f, "SerdeJsonError: {e}"),
-            KvDatabaseError::WalletNotInitialized => write!(f, "WalletNotInitialized"),
-            KvDatabaseError::DeserializeError(e) => write!(f, "DeserializeError: {e}"),
-            KvDatabaseError::TransactionNotFound => write!(f, "TransactionNotFound"),
-        }
-    }
-}
-
-impl Error for KvDatabaseError {}
 
 type Result<T> = floresta_common::prelude::Result<T, KvDatabaseError>;
 
@@ -69,7 +62,7 @@ impl AddressCacheDatabase for KvDatabase {
             if *"height" == key || *"desc" == key {
                 continue;
             }
-            let value: Vec<u8> = item.value().unwrap();
+            let value: Vec<u8> = item.value()?;
             let value = serde_json::from_slice(&value)?;
             addresses.push(value);
         }
@@ -77,12 +70,18 @@ impl AddressCacheDatabase for KvDatabase {
     }
     fn save(&self, address: &super::CachedAddress) {
         let key = address.script_hash.to_string();
-        let value = serde_json::to_vec(&address).expect("Invalid object serialization");
+        let Ok(value) = serde_json::to_vec(&address) else {
+            error!("Could not serialize address {key} for cache persistence");
+            return;
+        };
 
-        self.1
-            .set(&key, &value)
-            .expect("Fatal: Database isn't working");
-        self.1.flush().expect("Could not write to disk");
+        if let Err(e) = self.1.set(&key, &value) {
+            error!("Failed to persist address entry {key}: {e}");
+            return;
+        }
+        if let Err(e) = self.1.flush() {
+            error!("Failed to flush address cache to disk for key {key}: {e}");
+        }
     }
     fn update(&self, address: &super::CachedAddress) {
         self.save(address);
@@ -104,7 +103,7 @@ impl AddressCacheDatabase for KvDatabase {
         let mut descs = self.descs_get()?;
         descs.push(String::from(descriptor));
         self.1
-            .set(&String::from("desc"), &serde_json::to_vec(&descs).unwrap())?;
+            .set(&String::from("desc"), &serde_json::to_vec(&descs)?)?;
         self.1.flush()?;
 
         Ok(())
@@ -164,7 +163,8 @@ impl AddressCacheDatabase for KvDatabase {
         for item in store.iter() {
             let item = item?;
             let key = item.key::<&[u8]>()?;
-            transactions.push(Txid::from_slice(key).unwrap());
+            let txid = Txid::from_slice(key).map_err(|_| KvDatabaseError::InvalidTxidKey)?;
+            transactions.push(txid);
         }
         Ok(transactions)
     }

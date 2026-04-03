@@ -15,6 +15,7 @@ bitcoin = { workspace = true, features = ["serde"] }
 kv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["alloc"] }
+thiserror = "2.0"
 tracing = { workspace = true }
 
 # Local dependencies
